@@ -6,6 +6,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"go/ast"
@@ -29,6 +30,7 @@ var (
 	prefix        = flag.String("prefix", "", "custom Objective-C name prefix. Valid only with -lang=objc.")
 	bootclasspath = flag.String("bootclasspath", "", "Java bootstrap classpath.")
 	classpath     = flag.String("classpath", "", "Java classpath.")
+	overlay       = flag.String("overlay", "", "read source files from JSON overlay file.")
 	tags          = flag.String("tags", "", "build tags.")
 )
 
@@ -53,12 +55,19 @@ func run() {
 
 	// We need to give appropriate environment variables like CC or CXX so that the returned packages no longer have errors.
 	// However, getting such environment variables is difficult or impossible so far.
-	// Gomobile can obtain such environment variables in env.go, but this logic assumes some condiitons gobind doesn't assume.
+	// Gomobile can obtain such environment variables in env.go, but this logic assumes some conditions gobind doesn't assume.
 	cfg := &packages.Config{
 		Mode: packages.NeedName | packages.NeedFiles |
 			packages.NeedImports | packages.NeedDeps |
 			packages.NeedTypes | packages.NeedSyntax | packages.NeedTypesInfo,
 		BuildFlags: []string{"-tags", strings.Join(strings.Split(*tags, ","), " ")},
+	}
+	if *overlay != "" {
+		overlay, err := readOverlay(*overlay)
+		if err != nil {
+			log.Fatal(err)
+		}
+		cfg.Overlay = overlay
 	}
 
 	// Call Load twice to warm the cache. There is a known issue that the result of Load
@@ -157,6 +166,35 @@ func run() {
 		// Generate the error package and support files
 		genPkg(l, nil, nil, typePkgs, classes, otypes)
 	}
+}
+
+func readOverlay(filename string) (map[string][]byte, error) {
+	b, err := os.ReadFile(filename)
+	if err != nil {
+		return nil, fmt.Errorf("reading overlay: %w", err)
+	}
+	var overlay struct {
+		Replace map[string]string
+	}
+	if err := json.Unmarshal(b, &overlay); err != nil {
+		return nil, fmt.Errorf("parsing overlay JSON: %w", err)
+	}
+	replacements := make(map[string][]byte, len(overlay.Replace))
+	for from, to := range overlay.Replace {
+		from, err = filepath.Abs(from)
+		if err != nil {
+			return nil, err
+		}
+		if to == "" {
+			return nil, fmt.Errorf("overlay deletion of %q is not supported", from)
+		}
+		contents, err := os.ReadFile(to)
+		if err != nil {
+			return nil, fmt.Errorf("reading overlay replacement %q: %w", to, err)
+		}
+		replacements[from] = contents
+	}
+	return replacements, nil
 }
 
 var exitStatus = 0

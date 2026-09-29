@@ -6,9 +6,12 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -82,6 +85,49 @@ func mustHaveBindTestdata(t testing.TB) {
 	}
 }
 
+// copyMobileTree returns a packagestest file set for the x/mobile module rooted
+// at root. It is a stricter variant of [packagestest.MustCopyFileTree] that skips
+// the .git directory and tolerates files that disappear during the walk, which
+// avoids spurious failures when a concurrent git operation creates and then
+// removes .git/index.lock (golang/go#70207).
+func copyMobileTree(tb testing.TB, root string) map[string]any {
+	tb.Helper()
+	result := map[string]any{}
+	err := filepath.Walk(filepath.FromSlash(root), func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			// A file may vanish mid-walk (e.g. .git/index.lock from a
+			// concurrent git operation). Skip it instead of failing.
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if info.IsDir() {
+			if path != root {
+				// Skip .git: see golang/go#70207.
+				if filepath.Base(path) == ".git" {
+					return filepath.SkipDir
+				}
+				// Skip nested modules.
+				if fi, err := os.Stat(filepath.Join(path, "go.mod")); err == nil && !fi.IsDir() {
+					return filepath.SkipDir
+				}
+			}
+			return nil
+		}
+		fragment, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		result[filepath.ToSlash(fragment)] = packagestest.Copy(path)
+		return nil
+	})
+	if err != nil {
+		tb.Fatalf("copyMobileTree(%q): %v", root, err)
+	}
+	return result
+}
+
 func gobindBin(t testing.TB) string {
 	switch runtime.GOOS {
 	case "js", "ios":
@@ -127,7 +173,7 @@ func testGobind(t *testing.T, exporter packagestest.Exporter) {
 	_, javapErr := exec.LookPath("javap")
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name:  "golang.org/x/mobile",
-		Files: packagestest.MustCopyFileTree("../.."),
+		Files: copyMobileTree(t, "../.."),
 	}})
 	defer exported.Cleanup()
 
@@ -143,6 +189,65 @@ func testGobind(t *testing.T, exporter packagestest.Exporter) {
 				t.Error(err)
 			}
 		})
+	}
+}
+
+func TestGobindOverlay(t *testing.T) { packagestest.TestAll(t, testGobindOverlay) }
+func testGobindOverlay(t *testing.T, exporter packagestest.Exporter) {
+	mustHaveBindTestdata(t)
+
+	const pkgPath = "example.com/overlaytest"
+	suffix := fmt.Sprintf("%d", rand.Uint32())
+	oldAPI := "OldAPI" + suffix
+	newAPI := "NewAPI" + suffix
+	oldJavaAPI := "oldAPI" + suffix
+	newJavaAPI := "newAPI" + suffix
+	exported := packagestest.Export(t, exporter, []packagestest.Module{
+		{
+			Name: pkgPath,
+			Files: map[string]any{
+				"overlaytest.go": fmt.Sprintf("package overlaytest\n\nfunc %s() {}\n", oldAPI),
+			},
+		},
+		{
+			Name:  "golang.org/x/mobile",
+			Files: copyMobileTree(t, "../.."),
+		},
+	})
+	defer exported.Cleanup()
+
+	replacement := filepath.Join(t.TempDir(), "overlaytest.go")
+	if err := os.WriteFile(replacement, []byte(fmt.Sprintf("package overlaytest\n\nfunc %s() {}\n", newAPI)), 0644); err != nil {
+		t.Fatal(err)
+	}
+	overlayJSON, err := json.Marshal(struct {
+		Replace map[string]string
+	}{
+		Replace: map[string]string{exported.File(pkgPath, "overlaytest.go"): replacement},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	overlayFile := filepath.Join(t.TempDir(), "overlay.json")
+	if err := os.WriteFile(overlayFile, overlayJSON, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(gobindBin(t), "-lang=java", "-overlay="+overlayFile, pkgPath)
+	cmd.Dir = exported.Config.Dir
+	cmd.Env = exported.Config.Env
+	stderr := new(strings.Builder)
+	cmd.Stderr = stderr
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("gobind failed: %v: %s", err, stderr)
+	}
+	// Java method names use lowerCamelCase, so NewAPI becomes newAPI.
+	if !bytes.Contains(out, []byte(newJavaAPI+"()")) {
+		t.Errorf("gobind output does not contain %s binding:\n%s", newAPI, out)
+	}
+	if bytes.Contains(out, []byte(oldJavaAPI+"()")) {
+		t.Errorf("gobind output unexpectedly contains %s binding:\n%s", oldAPI, out)
 	}
 }
 
@@ -167,7 +272,7 @@ type Struct struct{
 		{
 			// gobind requires golang.org/x/mobile to generate code for reverse bindings.
 			Name:  "golang.org/x/mobile",
-			Files: packagestest.MustCopyFileTree("../.."),
+			Files: copyMobileTree(t, "../.."),
 		},
 	})
 	defer exported.Cleanup()
@@ -196,7 +301,7 @@ func benchmarkGobind(b *testing.B, exporter packagestest.Exporter) {
 	_, javapErr := exec.LookPath("javap")
 	exported := packagestest.Export(b, exporter, []packagestest.Module{{
 		Name:  "golang.org/x/mobile",
-		Files: packagestest.MustCopyFileTree("../.."),
+		Files: copyMobileTree(b, "../.."),
 	}})
 	defer exported.Cleanup()
 

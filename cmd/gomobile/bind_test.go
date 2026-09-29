@@ -187,8 +187,8 @@ var bindAndroidTmpl = template.Must(template.New("output").Parse(`GOMOBILE={{.GO
 WORK=$WORK
 GOOS=android CGO_ENABLED=1 gobind -lang=go,java -outdir=$WORK{{if .JavaPkg}} -javapkg={{.JavaPkg}}{{end}} golang.org/x/mobile/asset
 mkdir -p $WORK/src-android-arm
-PWD=$WORK/src-android-arm GOMODCACHE=$GOPATH/pkg/mod GOOS=android GOARCH=arm CC=$NDK_PATH/toolchains/llvm/prebuilt/{{.NDKARCH}}/bin/armv7a-linux-androideabi16-clang CXX=$NDK_PATH/toolchains/llvm/prebuilt/{{.NDKARCH}}/bin/armv7a-linux-androideabi16-clang++ CGO_ENABLED=1 GOARM=7 GOPATH=$WORK:$GOPATH go mod tidy
-PWD=$WORK/src-android-arm GOMODCACHE=$GOPATH/pkg/mod GOOS=android GOARCH=arm CC=$NDK_PATH/toolchains/llvm/prebuilt/{{.NDKARCH}}/bin/armv7a-linux-androideabi16-clang CXX=$NDK_PATH/toolchains/llvm/prebuilt/{{.NDKARCH}}/bin/armv7a-linux-androideabi16-clang++ CGO_ENABLED=1 GOARM=7 GOPATH=$WORK:$GOPATH go build -x -buildmode=c-shared -o=$WORK/android/src/main/jniLibs/armeabi-v7a/libgojni.so ./gobind
+PWD=$WORK/src-android-arm GOMODCACHE=$GOPATH/pkg/mod GOOS=android GOARCH=arm CC=$NDK_PATH/toolchains/llvm/prebuilt/{{.NDKARCH}}/bin/clang{{.EXE}} --target=armv7a-linux-androideabi16 CXX=$NDK_PATH/toolchains/llvm/prebuilt/{{.NDKARCH}}/bin/clang++{{.EXE}} --target=armv7a-linux-androideabi16 CGO_ENABLED=1 GOARM=7 GOPATH=$WORK:$GOPATH go mod tidy
+PWD=$WORK/src-android-arm GOMODCACHE=$GOPATH/pkg/mod GOOS=android GOARCH=arm CC=$NDK_PATH/toolchains/llvm/prebuilt/{{.NDKARCH}}/bin/clang{{.EXE}} --target=armv7a-linux-androideabi16 CXX=$NDK_PATH/toolchains/llvm/prebuilt/{{.NDKARCH}}/bin/clang++{{.EXE}} --target=armv7a-linux-androideabi16 CGO_ENABLED=1 GOARM=7 GOPATH=$WORK:$GOPATH go build -x -buildmode=c-shared -o=$WORK/android/src/main/jniLibs/armeabi-v7a/libgojni.so ./gobind
 PWD=$WORK/java javac -d $WORK/javac-output -source 1.8 -target 1.8 -bootclasspath {{.AndroidPlatform}}/android.jar *.java
 jar c -C $WORK/javac-output .
 `))
@@ -400,5 +400,127 @@ func TestBindWithGoModules(t *testing.T) {
 				})
 			}
 		})
+	}
+}
+
+func TestBindMissingMobileModule(t *testing.T) {
+	if runtime.GOOS == "android" || runtime.GOOS == "ios" {
+		t.Skipf("gomobile and gobind are not available on %s", runtime.GOOS)
+	}
+
+	dir := t.TempDir()
+
+	if out, err := exec.Command("go", "build", "-o="+dir, "golang.org/x/mobile/cmd/gobind").CombinedOutput(); err != nil {
+		t.Fatalf("building gobind: %v: %s", err, string(out))
+	}
+	if out, err := exec.Command("go", "build", "-o="+dir, "golang.org/x/mobile/cmd/gomobile").CombinedOutput(); err != nil {
+		t.Fatalf("building gomobile: %v: %s", err, string(out))
+	}
+	path := dir
+	if p := os.Getenv("PATH"); p != "" {
+		path += string(filepath.ListSeparator) + p
+	}
+
+	projDir := filepath.Join(dir, "noxmobile")
+	if err := os.Mkdir(projDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	goVer := strings.TrimPrefix(runtime.Version(), "go")
+	if parts := strings.SplitN(goVer, ".", 3); len(parts) >= 2 {
+		goVer = parts[0] + "." + parts[1]
+	}
+	goMod := `module example.com/noxmobile
+
+go ` + goVer + "\n"
+	if err := os.WriteFile(filepath.Join(projDir, "go.mod"), []byte(goMod), 0644); err != nil {
+		t.Fatal(err)
+	}
+	const helloGo = `package noxmobile
+
+func Hello() string { return "hi" }
+`
+	if err := os.WriteFile(filepath.Join(projDir, "hello.go"), []byte(helloGo), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(filepath.Join(dir, "gomobile"), "bind", "-target=ios", ".")
+	cmd.Env = append(os.Environ(), "PATH="+path)
+	cmd.Dir = projDir
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("gomobile bind unexpectedly succeeded\noutput:\n%s", out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"gomobile bind requires golang.org/x/mobile",
+		"go get -tool golang.org/x/mobile/cmd/gobind",
+		"go.dev/issue/77183",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("error message does not contain %q\noutput:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "no Go package in golang.org/x/mobile/bind") {
+		t.Errorf("error message still contains the opaque gobind failure\noutput:\n%s", got)
+	}
+}
+
+func TestParseModuleVersions(t *testing.T) {
+	// A replacement in the source module is emitted without a version so that it
+	// stays effective even when the generated module selects another version.
+	const listOutput = `{
+	"Path": "example.com/main",
+	"Main": true,
+	"Dir": "/src/main"
+}
+{
+	"Path": "example.com/plain",
+	"Version": "v1.2.3",
+	"Dir": "/gopath/pkg/mod/example.com/plain@v1.2.3"
+}
+{
+	"Path": "example.com/localdep",
+	"Version": "v1.0.0",
+	"Dir": "/src/localdep",
+	"Replace": {
+		"Path": "../localdep",
+		"Dir": "/src/localdep"
+	}
+}
+{
+	"Path": "example.com/forked",
+	"Version": "v1.5.0",
+	"Replace": {
+		"Path": "example.com/fork",
+		"Version": "v1.6.0",
+		"Dir": "/gopath/pkg/mod/example.com/fork@v1.6.0"
+	}
+}
+`
+	const want = `module gobind
+
+replace example.com/main => /src/main
+
+require (
+	example.com/plain v1.2.3
+	example.com/localdep v1.0.0
+	example.com/forked v1.5.0
+)
+
+replace example.com/localdep => /src/localdep
+
+replace example.com/forked => example.com/fork v1.6.0
+`
+
+	f, err := parseModuleVersions(strings.NewReader(listOutput))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bs, err := f.Format()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(bs); got != want {
+		t.Errorf("got:\n%s\nwant:\n%s", got, want)
 	}
 }
